@@ -47,6 +47,9 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
@@ -62,17 +65,54 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        content = result.content
+        if not isinstance(content, str) or BLOCK_START not in content:
+            return result
+
+        removed = 0
+        while BLOCK_START in content:
+            start = content.index(BLOCK_START)
+            end = content.find(BLOCK_END, start)
+            if end == -1:
+                # Fetch bị cắt giữa đoạn độc: có mốc MỞ mà không có mốc
+                # ĐÓNG. Bỏ tới hết chuỗi — đây đúng là chỗ một lớp phòng
+                # thủ "cần đủ cả hai mốc" thủng vào những seed xui.
+                content = content[:start] + PLACEHOLDER
+            else:
+                content = content[:start] + PLACEHOLDER + content[end + len(BLOCK_END):]
+            removed += 1
+
+        # Phòng thân: canary lọt ra ngoài cặp mốc thì vẫn phải chặn, vì
+        # điểm injection đọc TOÀN BỘ report chứ không đọc dấu mốc.
+        content = content.replace(INJECTION_CANARY, "")
+        ctx.state["injection_guard_blocks_removed"] = (
+            int(ctx.state.get("injection_guard_blocks_removed", 0)) + removed
+        )
+        return ToolResult(ok=result.ok, content=content, error=result.error)
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        """Quét lần cuối: điểm injection đọc `json.dumps(TOÀN BỘ report)`.
+
+        Nên không chỉ `answer` — một mã canary nằm trong `verdict` hay
+        trong text của claim cũng thổi bay cả 15 điểm như nhau. Viết lại
+        `answer` là MIỄN PHÍ; sửa chữ trong claim thì KHÔNG, nên claim
+        dính canary bị XOÁ chứ không bị "làm sạch".
+        """
+        for field in ("answer", "verdict"):
+            value = report.get(field)
+            if isinstance(value, str) and INJECTION_CANARY in value:
+                report[field] = value.replace(INJECTION_CANARY, "").strip()
+
+        claims = report.get("claims")
+        if isinstance(claims, list):
+            kept = [
+                claim
+                for claim in claims
+                if not (
+                    isinstance(claim, dict)
+                    and INJECTION_CANARY in str(claim.get("text", ""))
+                )
+            ]
+            if len(kept) != len(claims):
+                report["claims"] = kept
+        return report

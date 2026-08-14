@@ -59,7 +59,33 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers import Evidence, claim_doc_id, claim_text, safe_to_nudge
 from harness.middleware import Middleware
+
+
+#: Kỷ luật trích dẫn, nhắc lại mỗi lượt sau lượt assistant đầu tiên.
+#:
+#: ĐO ĐƯỢC trên endpoint thật (gpt-5.6-luna, pub-01): mô hình trích
+#: "Thời gian giao hàng cam kết hiện hành: nội thành 2 ngày làm việc;
+#: liên tỉnh 5 ngày làm việc." — NỬA ĐẦU của một dòng. Claim đó được
+#: chấm SUPPORTED, phạt 0.00... mà recall vẫn 0.00, vì `_covers` đòi
+#: >= `FACT_TERM_RATIO` (0.6) số từ khoá của dữ kiện: nửa dòng chỉ phủ
+#: 5/11 = 0.45. Chép TRỌN dòng thì phủ 11/11. Chênh lệch: 40.15 -> 100.
+#:
+#: Không mang `FINALIZE_SENTINEL`: câu này nhắc trích cho ĐÚNG, không
+#: bảo dừng.
+QUOTE_RULE = (
+    "QUY TẮC TRÍCH DẪN (bắt buộc, quyết định điểm): mỗi claim.text phải là "
+    "TRỌN MỘT DÒNG của tài liệu, chép y nguyên từ KÝ TỰ ĐẦU TIÊN của dòng "
+    "cho tới KÝ TỰ CUỐI CÙNG trước khi xuống dòng.\n"
+    "MỘT DÒNG THƯỜNG CHỨA NHIỀU CÂU. Phải chép HẾT các câu đó, không được "
+    "dừng ở dấu chấm đầu tiên. Ví dụ, với dòng:\n"
+    "    'A: x 2 ngày; y 5 ngày. Mọi B phải dựa trên C.'\n"
+    "thì claim.text ĐÚNG là cả dòng đó, còn chép mỗi "
+    "'A: x 2 ngày; y 5 ngày.' là SAI và bị chấm 0 điểm.\n"
+    "Không tóm tắt, không viết lại, không bỏ vế sau dấu chấm phẩy hay dấu "
+    "chấm; giữ nguyên mọi con số, tên riêng và dấu câu."
+)
 
 
 class CitationChecker(Middleware):
@@ -67,17 +93,60 @@ class CitationChecker(Middleware):
 
     name = "citation_checker"
 
+    def __init__(self, remind_quoting: bool = True) -> None:
+        self.remind_quoting = bool(remind_quoting)
+
+    def before_model(self, ctx, messages):
+        """Nhắc kỷ luật trích dẫn — SAU lượt assistant đầu tiên, luôn luôn.
+
+        `arena.model._first_user_content` đọc message user CUỐI CÙNG
+        TRƯỚC lượt assistant đầu tiên làm câu hỏi của brief, và chỉ bỏ
+        qua những message mang `FINALIZE_SENTINEL`. Chèn một câu nhắc
+        trơn vào phần mở đầu là biến chính câu nhắc thành câu hỏi cho cả
+        lượt chạy. Chờ tới khi đã có một lượt assistant thì vùng nguy
+        hiểm đó đã đóng lại, nên câu nhắc không thể bị nhầm là brief.
+        """
+        if not self.remind_quoting or not safe_to_nudge(messages):
+            return messages
+        # `messages + [...]`, không `append`: nhắc trong đúng lượt này.
+        return messages + [{"role": "user", "content": QUOTE_RULE}]
+
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        evidence = Evidence(ctx)
+        rewired = 0
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim_text(claim)
+            doc_id = claim_doc_id(claim)
+
+            # Trích dẫn đã đúng: tài liệu được nêu vừa nói câu này dưới
+            # dạng trích dẫn, vừa nằm trong số tài liệu lượt chạy đã đọc.
+            if doc_id in evidence.doc_ids and evidence.supports(doc_id, text):
+                continue
+
+            source = evidence.source_of(text)
+            if source is None:
+                # Không tài liệu nào đã đọc nói câu này -> BỊA, việc của
+                # `critic`. Đừng gán bừa một doc_id: đổi HALLUCINATED lấy
+                # MISATTRIBUTED chỉ là giấu lỗi đi cho đẹp.
+                continue
+            if source != doc_id:
+                claim["doc_id"] = source
+                rewired += 1
+
+        if rewired:
+            ctx.state["citation_checker_rewired"] = rewired
+        report["citations"] = sorted(
+            {
+                claim_doc_id(claim)
+                for claim in claims
+                if isinstance(claim, dict) and claim_doc_id(claim)
+            }
+        )
+        return report

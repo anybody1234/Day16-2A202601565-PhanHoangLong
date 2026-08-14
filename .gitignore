@@ -18,5 +18,12 @@ runs/
 # committed if it ever lands here: it is how the scored round stays scored.
 phases/private/
 
+# API credentials for the `--model real` path (ARENA_API_KEY & friends).
+# `.env.example` is the committed template; `.env` holds the real key and
+# must never leave this machine — `git add -A` would otherwise sweep it up.
+.env
+.env.*
+!.env.example
+
 # macOS
 .DS_Store

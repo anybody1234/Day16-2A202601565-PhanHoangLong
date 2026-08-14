@@ -61,7 +61,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import is_degraded  # noqa: F401  (dùng trong phần TODO)
+from arena.model import is_degraded
 
 from harness.middleware import Middleware
 
@@ -70,6 +70,11 @@ DEFAULT_MAX_ATTEMPTS = 3
 
 #: Số lượt để dành cho `submit` mà agent vẫn còn phải gọi.
 DEFAULT_RESERVE = 1
+
+#: Hỏng TẤT ĐỊNH, không phải hỏng ngẫu nhiên: `arena/tools.py` sinh hai
+#: lỗi này TRƯỚC khi tung xúc xắc `_roll`, nên gọi lại cũng ra đúng vậy.
+#: Thử lại chỉ đốt ngân sách — mà ngân sách là điểm efficiency.
+DETERMINISTIC_ERRORS = ("doc not found:", "invalid expression:")
 
 
 class Retry(Middleware):
@@ -85,17 +90,46 @@ class Retry(Middleware):
         self.max_attempts = max(1, int(max_attempts))
         self.reserve = max(0, int(reserve))
 
+    def _broken(self, result) -> bool:
+        """`ok=True` KHÔNG có nghĩa là ổn — bản bị cắt và bản nhiễu đều
+        về với `ok=True`. Đó chính là cái bẫy của §7."""
+        content = result.content if isinstance(result.content, str) else ""
+        return (not result.ok) or is_degraded(content)
+
+    def _worth_retrying(self, result) -> bool:
+        error = result.error if isinstance(result.error, str) else ""
+        return not error.startswith(DETERMINISTIC_ERRORS)
+
+    def _budget_exhausted(self, ctx) -> bool:
+        """Phải tự kiểm: `wrap_tool_call` của `budget_policy` bọc NGOÀI
+        vòng lặp này nên nó chỉ nhìn thấy lượt gọi đầu tiên."""
+        limit = ctx.max_tool_calls
+        return limit is not None and ctx.tools.calls >= limit - self.reserve
+
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§7): khoảng 8-12 dòng.
-        #  1. Trong khi số lần đã thử < self.max_attempts VÀ kết quả còn
-        #     hỏng — tức `(not result.ok) or is_degraded(result.content)` —
-        #     thì gọi lại `call(name, args)` với ĐÚNG name/args cũ.
-        #  2. DỪNG THỬ LẠI khi ngân sách đã cạn: nếu
-        #     `ctx.max_tool_calls` khác None và
-        #     `ctx.tools.calls >= ctx.max_tool_calls - self.reserve`
-        #     thì đừng gọi thêm lượt nào nữa (xem phần cảnh báo ở trên).
-        #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
-        #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
-        #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        attempts = 1
+
+        while (
+            attempts < self.max_attempts
+            and self._broken(result)
+            and self._worth_retrying(result)
+            and not self._budget_exhausted(ctx)
+        ):
+            # Cùng name/args: tầng công cụ khoá xác suất hỏng theo
+            # (seed, số thứ tự lượt gọi), nên lượt gọi lại rơi vào một
+            # chỉ số MỚI và được tung lại độc lập.
+            result = call(name, args)
+            attempts += 1
+
+        if attempts > 1:
+            # Chỉ int/str: `Trace.emit` giữ THAM CHIẾU tới thứ được đưa
+            # vào, nên không bao giờ đưa một mutable vào ctx.state đang
+            # còn bị sửa.
+            ctx.state["retry_attempts"] = (
+                int(ctx.state.get("retry_attempts", 0)) + attempts - 1
+            )
+            ctx.state["retry_last_tool"] = str(name)
+        # Trả về kết quả cuối kể cả khi vẫn hỏng: agent phải nhìn thấy
+        # sự thật, đừng bịa nội dung thay nó.
+        return result

@@ -70,7 +70,31 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers import (
+    MAX_CLAIMS_PER_DOC,
+    MAX_SCORED_CLAIMS,
+    Evidence,
+    claim_doc_id,
+    claim_text,
+    norm_text,
+    trim_to_norm_limit,
+)
 from harness.middleware import Middleware
+
+#: Chỗ dán mà mô hình dùng khi ghép nửa câu của hai tài liệu mâu thuẫn
+#: thành MỘT câu không tài liệu nào nói. Xếp từ dài tới ngắn để " và "
+#: không cắt trước " trong khi ".
+FUSE_SEPARATORS = (
+    " trong khi ",
+    ", còn ",
+    " nhưng ",
+    " còn ",
+    " và ",
+    "; ",
+)
+
+#: Câu mở đầu khi không còn claim nào đứng vững.
+NO_EVIDENCE = "Không đủ căn cứ trong tài liệu đã truy xuất để khẳng định."
 
 
 class Critic(Middleware):
@@ -79,16 +103,128 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        evidence = Evidence(ctx)
+        kept: list[dict] = []
+        dropped = 0
+        split = 0
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                dropped += 1
+                continue
+            text = claim_text(claim)
+            doc_id = claim_doc_id(claim)
+
+            # Điều kiện giữ phải TRÙNG với điều kiện bộ chấm cho điểm,
+            # không phải `ctx.saw` trần: một chuỗi 5 ký tự vẫn `saw()`
+            # nhưng bị chấm HALLUCINATED, và HALLUCINATED xoá sạch 15
+            # điểm honesty trên MỌI brief.
+            if evidence.saw(text) and evidence.supports(doc_id, text):
+                kept.append(claim)
+                continue
+
+            halves = self._split_fused(evidence, text)
+            if halves:
+                # Câu ghép từ hai nguồn mâu thuẫn. Hai nửa vẫn là chữ mô
+                # hình (cắt = substring), nên vẫn qua được provenance.
+                kept.extend(halves)
+                split += 1
+                report["abstain"] = True
+                continue
+
+            dropped += 1
+
+        kept = self._drop_free_penalties(kept)
+
+        if kept:
+            report["claims"] = kept
+        else:
+            report["claims"] = []
+            report["citations"] = []
+            report["abstain"] = True
+            # Thêm câu "không đủ căn cứ" vào ĐẦU answer cũ chứ không xoá
+            # trắng: recall còn một kênh `stated` đọc `answer[:1500]`, và
+            # answer cũ là chữ mô hình nên vẫn được tính. Xoá trắng là tự
+            # vứt phần điểm đó đi.
+            answer = report.get("answer")
+            answer = answer if isinstance(answer, str) else ""
+            report["answer"] = (NO_EVIDENCE + " " + answer).strip()
+
+        if report["claims"]:
+            report["citations"] = sorted(
+                {
+                    claim_doc_id(claim)
+                    for claim in report["claims"]
+                    if claim_doc_id(claim)
+                }
+            )
+        ctx.state["critic_dropped"] = dropped
+        ctx.state["critic_split"] = split
+        return report
+
+    # -- trường hợp (c): câu ghép từ hai tài liệu mâu thuẫn -------------
+
+    def _split_fused(self, evidence, text: str):
+        """Tách câu ghép thành hai nửa có nguồn thật, hoặc None.
+
+        Chỉ chấp nhận khi CẢ HAI nửa đều là trích dẫn nguyên văn một dòng
+        của HAI tài liệu KHÁC NHAU mà lượt chạy đã đọc — đúng điều kiện
+        `_supports` của bộ chấm. Cắt sai chỗ thì một nửa sẽ vắt qua hai
+        tài liệu và không nửa nào tìm được nguồn, nên phép thử này tự nó
+        loại được chỗ cắt sai.
+        """
+        if not text:
+            return None
+        for separator in FUSE_SEPARATORS:
+            start = 0
+            while True:
+                position = text.find(separator, start)
+                if position == -1:
+                    break
+                start = position + 1
+                left = text[:position].strip()
+                right = text[position + len(separator):].strip()
+                left_doc = evidence.source_of(left)
+                right_doc = evidence.source_of(right)
+                if left_doc and right_doc and left_doc != right_doc:
+                    return [
+                        {"text": left, "doc_id": left_doc},
+                        {"text": right, "doc_id": right_doc},
+                    ]
+        return None
+
+    # -- dọn những claim bị phạt trọn 1.0 dù nội dung có đúng ----------
+
+    def _drop_free_penalties(self, claims: list) -> list:
+        """Cắt/bỏ những claim bộ chấm phạt 1.0 vì HÌNH DẠNG, không vì nội dung.
+
+        `precision = 1 - Σphạt/n`, nên bỏ một claim bị phạt nặng hơn mức
+        phạt trung bình luôn làm precision tăng. Ba loại này đều bị phạt
+        trọn 1.0 và KHÔNG đóng góp gì cho recall (bộ chấm cắt `text` khỏi
+        verdict của chúng), nên bỏ đi là lãi ròng:
+          OVERLONG  — `len(norm(text)) > 500`  -> cắt bớt là hợp lệ
+          REDUNDANT — claim thứ 5 trở đi của cùng một doc_id
+          EXCESS    — claim thứ 11 trở đi
+        """
+        result: list[dict] = []
+        per_doc: dict[str, int] = {}
+        for claim in claims:
+            if len(result) >= MAX_SCORED_CLAIMS:
+                break
+            text = trim_to_norm_limit(claim_text(claim))
+            if not norm_text(text):
+                continue
+            doc_id = claim_doc_id(claim)
+            if doc_id:
+                seen = per_doc.get(doc_id, 0)
+                if seen >= MAX_CLAIMS_PER_DOC:
+                    continue
+                per_doc[doc_id] = seen + 1
+            if text != claim_text(claim):
+                claim = {**claim, "text": text}
+            result.append(claim)
+        return result
